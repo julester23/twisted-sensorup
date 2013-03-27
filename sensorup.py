@@ -5,9 +5,9 @@ import logging
 import sqlite3
 import txcosm.HTTPClient
 import json
-from twisted.internet import reactor, defer, task
+from twisted.internet import defer
 #Define API_KEY and FEED_ID in config/cosm_keys.py or simply define here and remove this:
-from config.cosm_keys import API_KEY,FEED_ID
+from config.cosm_keys import API_KEY,FEED_ID,SQLITE_FILE
 
 
 

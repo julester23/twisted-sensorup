@@ -1,1 +1,5 @@
 config/*
+rhotech_*
+*.pyc
+txcosm/*
+sensor_cache.db
