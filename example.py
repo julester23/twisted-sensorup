@@ -3,8 +3,6 @@
 import sensorup
 import logging
 from twisted.internet import defer, task, reactor
-#Define API_KEY and FEED_ID in config/cosm_keys.py or simply define here and remove this:
-from config.cosm_keys import API_KEY,FEED_ID,SQLITE_FILE
 
 class fake_sensor(object):
 	def get_temp_channel(args):
@@ -14,11 +12,9 @@ class fake_sensor(object):
 
 def main():
 
-	import logging
 	logging.basicConfig(level=logging.DEBUG, format="%(asctime)-15s %(message)s")
 	logging.info('Starting up')
 
-	monitor = {}
 	#sensor_pollers, buffer_unloaders, sqlite_unloaders are worker lists
 	sensor_pollers, buffer_unloaders, sqlite_unloaders = [], [], []
 	upload_tasks = defer.DeferredQueue()
@@ -31,17 +27,15 @@ def main():
 	for source in fake_sensors:
 		name = 'temp%d' % (1,)
 		#Create a datapointBuffer which will call source_method (with optional source_method_args) to retrieve a datapoint)
-		monitor[name] = sensorup.datapointBuffer(source_method=source.get_flow,
-										source_method_args=None,
+		dp_buffer = sensorup.datapointBuffer(source_method=source.get_temp_channel,
+										source_method_args=0,
 										datastream_id=name)
 		#Add this new datasource (datapointBuffer instance) to worker lists
 
 		#sensorPollAndBuffer: poll for new data and store in an in-memory list
-		sensor_pollers.append(task.LoopingCall(sensorup.sensorPollAndBuffer, monitor[name]))
+		sensor_pollers.append(task.LoopingCall(sensorup.sensorPollAndBuffer, dp_buffer))
 		#bufferUnloadAndUpload: Flushes in-memory list of datapoints, and attempts uploading to Cosm. Failures go into sqlite.
-		buffer_unloaders.append(task.LoopingCall(sensorup.bufferUnloadAndUpload, monitor[name], upload_tasks))
-		#getSqliteDataAndUpload: Reads from sqlite database (on-disk) and attempts to upload to Cosm.
-		sqlite_unloaders.append(task.LoopingCall(sensorup.getSqliteDataAndUpload, monitor[name], upload_tasks))
+		buffer_unloaders.append(task.LoopingCall(sensorup.bufferUnloadAndUpload, dp_buffer, upload_tasks))
 	
 	#Collect datapoint every 1s
 	for poller in sensor_pollers:
@@ -53,10 +47,6 @@ def main():
 	#interval for sqlite_unloaders should be sufficiently large as to prevent double uploading
 	# sqlite_unloader interval > buffer_unloaders interval
 	# sqlite_unloader interval > client.request_timeout * sensor count
-
-	#Upload previously upload failing datapoints every 3600s
-	for poller in sqlite_unloaders:
-		poller.start(3600.0)
 
 	#Flush old datapoints from the database every 86400s
 	sqlite_purger = task.LoopingCall(sensorup.sqlite_purge)

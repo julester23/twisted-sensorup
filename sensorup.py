@@ -52,6 +52,9 @@ class sqlite(object):
 		self.cursor = self.conn.cursor()
 		self.workset_table = None
 		self.workset = None
+		self.workset_status = 0
+		self.create_table = '''CREATE TABLE IF NOT EXISTS %s
+				 (id INTEGER PRIMARY KEY, date DATETIME, value TEXT, status INTEGER DEFAULT 0, ntp INTEGER DEFAULT 0)'''
 
 	def _adapt_to_sqlite_ts(self, datetime_object):
 		return datetime_object.strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -61,8 +64,7 @@ class sqlite(object):
 
 	def store(self, datastream_id, data):
 		# Create table
-		self.cursor.execute('''CREATE TABLE IF NOT EXISTS %s
-				 (id INTEGER PRIMARY KEY, date DATETIME, value TEXT, uploaded INTEGER DEFAULT 0, ntp INTEGER DEFAULT 0)''' % (datastream_id,))
+		self.cursor.execute(self.create_table % (datastream_id,))
 		#logging.info("Creating table %s" % datastream_id)
 
 		# Insert a row of data
@@ -80,27 +82,32 @@ class sqlite(object):
 		self.cursor.execute('VACUUM')
 		self.conn.commit()
 
-	def purge_all(self, cutoff_date):
+	def fetch_table_names(self):
 		self.cursor.execute('SELECT tbl_name FROM sqlite_master')
-		for row in self.cursor.fetchall():
-			self.purge(cutoff_date=cutoff_date, datastream_id=row[0])
+		return [str(row[0]) for row in self.cursor.fetchall()]
+
+	def purge_all(self, cutoff_date):
+		for tbl_name in self.fetch_table_names():
+			self.purge(cutoff_date=cutoff_date, datastream_id=tbl_name)
 
 
 	def fetch_failed_uploads(self, datastream_id):
-		self.cursor.execute('''CREATE TABLE IF NOT EXISTS %s
-				 (id INTEGER PRIMARY KEY, date DATETIME, value TEXT, uploaded INTEGER DEFAULT 0, ntp INTEGER DEFAULT 0)''' % (datastream_id,))
+		self.cursor.execute(self.create_table % (datastream_id,))
+		#self.cursor.execute('''CREATE TABLE IF NOT EXISTS %s
+		#		 (id INTEGER PRIMARY KEY, date DATETIME, value TEXT, status INTEGER DEFAULT 0, ntp INTEGER DEFAULT 0)''' % (datastream_id,))
 		self.conn.commit()
-		self.cursor.execute('SELECT id, date, value, uploaded FROM %s WHERE uploaded=0 LIMIT 400' % datastream_id)
+		self.cursor.execute('SELECT id, date, value, status FROM %s WHERE status=0 LIMIT 400' % datastream_id)
 		result = self.cursor.fetchall()
 		self.workset = [str(row[0]) for row in result]
 		self.workset_table = datastream_id
+		self.set_workset_status(1)
 		return [{'at': row[1], 'value': row[2]} for row in result]
 
-	def mark_previous_fetch_as_uploaded(self):
+	def set_workset_status(self, status):
 		if self.workset and self.workset_table:
-			self.cursor.execute('UPDATE %s SET uploaded=1 WHERE id IN (%s)' % (self.workset_table, ','.join(self.workset)))
+			self.cursor.execute('UPDATE %s SET status=%s WHERE id IN (%s)' % (self.workset_table, status, ','.join(self.workset)))
 			self.conn.commit()
-			logging.debug('SQLITE: marked successfully uploaded datapoints')
+			logging.debug('SQLITE: updated status to %s for workset' % status)
 
 	def delete_previous_fetch(self):
 		if self.workset and self.workset_table:
@@ -112,6 +119,10 @@ class sqlite(object):
 	def __del__(self):
 		# We can also close the connection if we are done with it.
 		# Just be sure any changes have been committed or they will be lost.
+		
+		#Reset the status column to 0 before forgetting about the workset
+		if self.workset_status != 0:
+			self.set_workset_status(0)
 		self.conn.close()
 
 class uploadTask(object):
@@ -153,20 +164,35 @@ def uploadOrStore(upload_task):
 
 
 @defer.inlineCallbacks
-def worker(tasks):
+def worker(upload_queue):
 	def failure(failure):
 		logging.warn("uploadOrStore failure: %s" % (failure.getTraceback(),))
 		#failure.trap(Error)
 	while True:
-		returnVal = yield tasks.get().addCallback(uploadOrStore).addErrback(failure)
-		#returnVal = yield tasks.get().addCallback(uploadOrStore).addErrback(twisted.python.log.err)
-		logging.debug('RETURNED: %s' % returnVal)
+		success = yield upload_queue.get().addCallback(uploadOrStore).addErrback(failure)
+		#If last upload was successful, add a task to the upload_queue
+		if success:
+			backloaderAddOneTask(upload_queue)
+		#logging.debug('RETURNED: %s' % success)
 
-def getSqliteDataAndUpload(monitor_instance, tasks):
+#Reads from sqlite database (on-disk) and adds a task to the upload_queue for the first backed up sensor data it finds
+def backloaderAddOneTask(upload_queue):
 	s = sqlite()
-	data = s.fetch_failed_uploads(monitor_instance.datastream_id)
-	if data:
-		tasks.put(uploadTask(datastream_id=monitor_instance.datastream_id, data=data, sqlite=s))
+	for datastream_id in s.fetch_table_names():
+		logging.debug(datastream_id)
+		data = s.fetch_failed_uploads(datastream_id)
+		if data:
+			upload_queue.put(uploadTask(datastream_id=datastream_id, data=data, sqlite=s))
+			logging.debug('Backloading %s' % datastream_id)
+			#Only add one task at a time - best not to overwhelm current uploads
+			break
+
+#def getSqliteDataAndUpload(monitor_instance, upload_queue):
+#	s = sqlite()
+#	data = s.fetch_failed_uploads(monitor_instance.datastream_id)
+#	if data:
+#		upload_queue.put(uploadTask(datastream_id=monitor_instance.datastream_id, data=data, sqlite=s))
+
 
 def sensorPollAndBuffer(monitor_instance):
 	monitor_instance.get_new_data()
@@ -178,5 +204,5 @@ def bufferUnloadAndUpload(monitor_instance, upload_queue):
 
 def sqlite_purge():
 	s = sqlite()
-	s.purge_all(cutoff_date=(datetime.datetime.utcnow().replace(microsecond=0)-datetime.timedelta(days=30)))
+	s.purge_all(cutoff_date=(datetime.datetime.utcnow().replace(microsecond=0)-datetime.timedelta(days=10)))
 
